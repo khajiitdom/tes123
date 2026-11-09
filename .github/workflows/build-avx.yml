@@ -1,0 +1,58 @@
+name: Build FSMP v4.1.1 AVX + contact bridge
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout kit (bridge_core + patch)
+        uses: actions/checkout@v4
+
+      - name: Clone upstream v4.1.1 with submodules (LF endings)
+        shell: bash
+        run: |
+          git -c core.autocrlf=false clone --branch v4.1.1 --recurse-submodules https://github.com/DaymareOn/hdtSMP64 fsmp_4_1_1_avx
+          cd fsmp_4_1_1_avx
+          test "$(git rev-parse HEAD)" = "e52ad960048c14e637d14fcbd65314ca017fc3b8" || { echo "Commit v4.1.1 tidak cocok"; exit 1; }
+
+      - name: Apply contact bridge patch
+        shell: bash
+        run: |
+          cd fsmp_4_1_1_avx
+          git apply --check ../FSMP_v4.1.1_contact_bridge_LF.patch
+          git apply --whitespace=nowarn ../FSMP_v4.1.1_contact_bridge_LF.patch
+
+      - name: Configure (preset vs2022-windows-avx)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/out/plugins/SKSE/Plugins" | Out-Null
+          Set-Location fsmp_4_1_1_avx
+          cmake --preset vs2022-windows-avx `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_MODE=ON `
+            -DCompiledPluginsPath="$env:GITHUB_WORKSPACE/out/plugins"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          Set-Location fsmp_4_1_1_avx
+          cmake --build out/build/vs2022-windows-avx --config Release
+
+      - name: Verify DLL is AVX and has the contact bridge export
+        shell: pwsh
+        run: |
+          $dll = "$env:GITHUB_WORKSPACE/out/plugins/SKSE/Plugins/hdtSMP64.dll"
+          $pv = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($dll).ProductVersion
+          Write-Host "ProductVersion: $pv"
+          if ($pv -notmatch '\(avx\)') { Write-Error "Bukan build AVX"; exit 1 }
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dll))
+          if (-not $text.Contains('GTFSMP_GetContactBridgeV1')) { Write-Error "Export contact bridge tidak ada"; exit 1 }
+          Write-Host "OK: AVX + GTFSMP_GetContactBridgeV1"
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdtSMP64-4.1.1-avx-contact-bridge
+          path: out/plugins/SKSE/Plugins/
