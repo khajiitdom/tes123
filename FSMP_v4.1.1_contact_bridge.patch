@@ -1,0 +1,1179 @@
+diff -ruN up_v4.1.1/CMakeLists.txt mine_v4.1.1/CMakeLists.txt
+--- up_v4.1.1/CMakeLists.txt	2026-08-27 03:59:52.000000000 +0900
++++ mine_v4.1.1/CMakeLists.txt	2026-09-29 20:40:18.746181300 +0900
+@@ -1,9 +1,9 @@
+ cmake_minimum_required(VERSION 3.22)
+ 
+-project(
+-	hdtsmp64
+-	VERSION 3.0.0
+-	LANGUAGES CXX)
++project(
++	hdtsmp64
++	VERSION 4.1.1
++	LANGUAGES CXX)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ # Pre-release build identifier (e.g. "dev-abc1234"). Empty for production builds.
+diff -ruN up_v4.1.1/src/CMakeLists.txt mine_v4.1.1/src/CMakeLists.txt
+--- up_v4.1.1/src/CMakeLists.txt	2026-08-27 03:59:52.000000000 +0900
++++ mine_v4.1.1/src/CMakeLists.txt	2026-09-29 20:40:18.667443100 +0900
+@@ -2,7 +2,17 @@
+ 
+ add_compile_definitions(_SILENCE_AMP_DEPRECATION_WARNINGS NOMINMAX)
+ 
+-set(SOURCE_DIR "${ROOT_DIR}/src")
++set(SOURCE_DIR "${ROOT_DIR}/src")
++
++set(GT_CONTACT_BRIDGE_CORE_DIR "${ROOT_DIR}/../bridge_core")
++if(NOT EXISTS "${GT_CONTACT_BRIDGE_CORE_DIR}/include/GTContactBridgeABI.h" OR
++   NOT EXISTS "${GT_CONTACT_BRIDGE_CORE_DIR}/src/GTContactFrameCollector.cpp")
++	message(FATAL_ERROR "Phase 2 GT contact bridge core is missing: ${GT_CONTACT_BRIDGE_CORE_DIR}")
++endif()
++set(GT_CONTACT_BRIDGE_CORE_FILES
++	"${GT_CONTACT_BRIDGE_CORE_DIR}/include/GTContactBridgeABI.h"
++	"${GT_CONTACT_BRIDGE_CORE_DIR}/include/GTContactFrameCollector.h"
++	"${GT_CONTACT_BRIDGE_CORE_DIR}/src/GTContactFrameCollector.cpp")
+ 
+ set(SOURCE_FILES
+ 	"${SOURCE_DIR}/hdtSkinnedMesh/hdtAABB.h"
+@@ -32,9 +42,12 @@
+ 	"${SOURCE_DIR}/hdtSkinnedMesh/hdtSkinnedMeshWorld.cpp"
+ 	"${SOURCE_DIR}/hdtSkinnedMesh/hdtSkinnedMeshWorld.h"
+ 	"${SOURCE_DIR}/hdtSkinnedMesh/hdtStiffSpringConstraint.cpp"
+-	"${SOURCE_DIR}/hdtSkinnedMesh/hdtStiffSpringConstraint.h"
+-	"${SOURCE_DIR}/hdtSkinnedMesh/hdtVertex.cpp"
+-	"${SOURCE_DIR}/hdtSkinnedMesh/hdtVertex.h"
++	"${SOURCE_DIR}/hdtSkinnedMesh/hdtStiffSpringConstraint.h"
++	"${SOURCE_DIR}/hdtSkinnedMesh/hdtVertex.cpp"
++	"${SOURCE_DIR}/GTContactBridgeProducer.cpp"
++	"${SOURCE_DIR}/GTContactBridgeProducer.h"
++	"${SOURCE_DIR}/GTContactFrameTiming.h"
++	"${SOURCE_DIR}/hdtSkinnedMesh/hdtVertex.h"
+ 	"${SOURCE_DIR}/Events.h"
+ 	"${SOURCE_DIR}/Events.cpp"
+ 	"${SOURCE_DIR}/HavokUtils.h"
+@@ -137,7 +150,8 @@
+ 	"${SOURCE_DIR}/main.h"
+ 	"${SOURCE_DIR}/main.cpp"
+ 	"${SOURCE_DIR}/PCH.h")
+-source_group(TREE "${ROOT_DIR}" FILES ${SOURCE_FILES})
++source_group(TREE "${ROOT_DIR}" FILES ${SOURCE_FILES})
++source_group("Phase 2 Contact Bridge Core" FILES ${GT_CONTACT_BRIDGE_CORE_FILES})
+ 
+ set(VERSION_HEADER "${CMAKE_CURRENT_BINARY_DIR}/src/Plugin.h")
+ 
+@@ -176,8 +190,8 @@
+ 	set(DETOURS_LIBRARY_DEBUG ${DETOURS_LIBRARY_RELEASE})
+ endif()
+ 
+-add_library("${PROJECT_NAME}" SHARED ${SOURCE_FILES} "${VERSION_HEADER}" "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
+-									 "${ROOT_DIR}/.clang-format" "${ROOT_DIR}/.editorconfig")
++add_library("${PROJECT_NAME}" SHARED ${SOURCE_FILES} ${GT_CONTACT_BRIDGE_CORE_FILES} "${VERSION_HEADER}" "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
++									 "${ROOT_DIR}/.clang-format" "${ROOT_DIR}/.editorconfig")
+ 
+ target_compile_features("${PROJECT_NAME}" PRIVATE cxx_std_20)
+ 
+@@ -230,9 +244,12 @@
+ endif()
+ file(WRITE "${SMF_PATCHED_DIR}/SKSEMenuFramework.h" "${SMF_HEADER}")
+ 
+-target_include_directories(
+-	"${PROJECT_NAME}" PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/src" "${SOURCE_DIR}" ${DETOURS_INCLUDE_DIRS}
+-							  ${BULLET_INCLUDE_DIRS} ${RAPIDJSON_INCLUDE_DIRS} "${SMF_PATCHED_DIR}")
++target_include_directories(
++	"${PROJECT_NAME}" PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/src" "${SOURCE_DIR}" ${DETOURS_INCLUDE_DIRS}
++							  "${GT_CONTACT_BRIDGE_CORE_DIR}/include"
++							  ${BULLET_INCLUDE_DIRS} ${RAPIDJSON_INCLUDE_DIRS} "${SMF_PATCHED_DIR}")
++
++target_compile_definitions("${PROJECT_NAME}" PRIVATE GT_CONTACT_BRIDGE_EXPORTS=1)
+ 
+ # The vendored SDK header trips two /W4 warnings of its own (C4099 struct/class tag mismatch on ImGuiTextFilter; C5054
+ # deprecated operator| between distinct ImGui enums). It is included only by FSMPMenu.cpp, so silence just those two
+diff -ruN up_v4.1.1/src/GTContactBridgeProducer.cpp mine_v4.1.1/src/GTContactBridgeProducer.cpp
+--- up_v4.1.1/src/GTContactBridgeProducer.cpp	1970-01-01 09:00:00.000000000 +0900
++++ mine_v4.1.1/src/GTContactBridgeProducer.cpp	2026-09-29 20:40:18.743678300 +0900
+@@ -0,0 +1,930 @@
++#include "GTContactBridgeProducer.h"
++
++#include "GTContactFrameCollector.h"
++#include "hdtSkinnedMesh/hdtSkinnedMeshBone.h"
++#include "hdtSkyrimBone.h"
++
++#include <BulletCollision/CollisionDispatch/btCollisionDispatcher.h>
++#include <BulletCollision/NarrowPhaseCollision/btPersistentManifold.h>
++#include <BulletDynamics/Dynamics/btRigidBody.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <mutex>
++#include <string_view>
++
++namespace hdt::gtcontact
++{
++	namespace
++	{
++		gt::contact::ContactFrameCollector g_collector;
++		std::atomic_bool g_captureEnabled{ false };
++		std::uint64_t g_nextFrameSequence{ 1 };
++		std::uint32_t g_substepIndex{ 0 };
++		bool g_frameOpen{ false };
++		std::mutex g_targetMutex;
++		std::array<std::uint64_t, GT_CONTACT_MAX_TARGET_SKELETONS> g_pendingTargets{};
++		std::size_t g_pendingTargetCount{ 0 };
++		std::uint64_t g_pendingTargetGeneration{ 0 };
++		std::array<std::uint64_t, GT_CONTACT_MAX_TARGET_SKELETONS> g_activeTargets{};
++		std::size_t g_activeTargetCount{ 0 };
++		std::uint64_t g_activeTargetGeneration{ 0 };
++
++		constexpr std::uint64_t kTelemetryFrameInterval = 300U;
++
++		struct ProducerTelemetry
++		{
++			std::uint64_t framesBegun{ 0 };
++			std::uint64_t framesPublished{ 0 };
++			std::uint64_t beginRejected{ 0 };
++			std::uint64_t forcedFrameClose{ 0 };
++			std::uint64_t expectedSubsteps{ 0 };
++			std::uint64_t observedSubsteps{ 0 };
++			std::uint64_t underflowFrames{ 0 };
++			std::uint64_t overflowFrames{ 0 };
++			std::uint64_t overflowCallbacks{ 0 };
++			std::uint64_t manifoldsScanned{ 0 };
++			std::uint64_t endpointDecodeFailures{ 0 };
++			std::uint64_t nonBreastManifolds{ 0 };
++			std::uint64_t nonTargetManifolds{ 0 };
++			std::uint64_t contactPointsSeen{ 0 };
++			std::uint64_t nonPenetratingPoints{ 0 };
++			std::uint64_t invalidSubstepTimes{ 0 };
++			std::uint64_t invalidPhysicsPoints{ 0 };
++			std::uint64_t targetEpochDrops{ 0 };
++			std::uint64_t addAccepted{ 0 };
++			std::uint64_t addDuplicateMerged{ 0 };
++			std::uint64_t addInvalid{ 0 };
++			std::uint64_t addNoOpenFrame{ 0 };
++			std::uint64_t addCapacityRetained{ 0 };
++			std::uint64_t addCapacityDropped{ 0 };
++			std::uint64_t continuitySubmitted{ 0 };
++			std::uint64_t fingerContacts{ 0 };
++			std::uint64_t handContacts{ 0 };
++			std::uint64_t armContacts{ 0 };
++			std::uint64_t legContacts{ 0 };
++			std::uint64_t footContacts{ 0 };
++			std::uint64_t otherExternalContacts{ 0 };
++			std::uint64_t breastToBreastContacts{ 0 };
++			std::uint64_t sameActorContacts{ 0 };
++			std::uint64_t crossActorContacts{ 0 };
++			float maximumDepth{ 0.0F };
++			float maximumImpulse{ 0.0F };
++			float maximumApproachSpeed{ 0.0F };
++		};
++
++		ProducerTelemetry g_telemetry{};
++		std::uint64_t g_lastTelemetryLogFrame{ 0 };
++		std::uint64_t g_lastAnomalyLogFrame{ 0 };
++
++		// FSMP can omit an otherwise continuous manifold for an isolated frame.
++		// Preserve one representative per rigid-body pair for three missing frames,
++		// fading penetration only.  This is deliberately bounded and allocation-free
++		// because it runs on the physics thread.
++		constexpr std::size_t kContinuityPairCapacity =
++			gt::contact::ContactFrameCollector::kPublishedCapacity;
++		constexpr std::uint64_t kContinuityMissingFrameTtl = 3U;
++		constexpr float kContinuityDecayDivisor =
++			static_cast<float>(kContinuityMissingFrameTtl + 1U);
++
++		struct ContinuityPair
++		{
++			GTContactEndpointV1 endpointA{};
++			GTContactEndpointV1 endpointB{};
++			// Contact points are kept in absolute world space and rebased when a
++			// synthetic sample is emitted, so an origin shift cannot move the hold.
++			GTContactSampleV1 strongestRealSample{};
++			std::uint64_t targetGeneration{ 0 };
++			std::uint64_t lastRealFrameSequence{ 0 };
++		};
++
++		std::array<ContinuityPair, kContinuityPairCapacity> g_continuityPairs{};
++		std::size_t g_continuityPairCount{ 0 };
++		std::uint64_t g_currentFrameSequence{ 0 };
++		std::uint64_t g_currentFrameTargetGeneration{ 0 };
++		float g_currentFrameTimeStep{ 0.0F };
++		std::uint32_t g_currentFrameSubstepCount{ 0 };
++		float g_lastObservedSubstepTime{ 0.0F };
++		std::array<float, 3> g_currentFrameOriginOffset{};
++
++		[[nodiscard]] int CompareEndpointIdentity(
++			const GTContactEndpointV1& lhs,
++			const GTContactEndpointV1& rhs) noexcept
++		{
++			if (lhs.skeletonToken != rhs.skeletonToken) {
++				return lhs.skeletonToken < rhs.skeletonToken ? -1 : 1;
++			}
++			if (lhs.boneNameHash != rhs.boneNameHash) {
++				return lhs.boneNameHash < rhs.boneNameHash ? -1 : 1;
++			}
++			const int nameResult =
++				std::memcmp(lhs.boneName, rhs.boneName, GT_CONTACT_BONE_NAME_CAPACITY);
++			if (nameResult != 0) {
++				return nameResult < 0 ? -1 : 1;
++			}
++			if (lhs.rigidBodyToken != rhs.rigidBodyToken) {
++				return lhs.rigidBodyToken < rhs.rigidBodyToken ? -1 : 1;
++			}
++			if (lhs.flags != rhs.flags) {
++				return lhs.flags < rhs.flags ? -1 : 1;
++			}
++			return 0;
++		}
++
++		void CanonicalPair(
++			const GTContactSampleV1& sample,
++			const GTContactEndpointV1*& endpointA,
++			const GTContactEndpointV1*& endpointB) noexcept
++		{
++			if (CompareEndpointIdentity(sample.endpointB, sample.endpointA) < 0) {
++				endpointA = &sample.endpointB;
++				endpointB = &sample.endpointA;
++			} else {
++				endpointA = &sample.endpointA;
++				endpointB = &sample.endpointB;
++			}
++		}
++
++		[[nodiscard]] float ApproachSpeed(const GTContactSampleV1& sample) noexcept
++		{
++			const float projected =
++				sample.relativeVelocityAminusB[0] * sample.normalOnB[0] +
++				sample.relativeVelocityAminusB[1] * sample.normalOnB[1] +
++				sample.relativeVelocityAminusB[2] * sample.normalOnB[2];
++			return std::max(0.0F, -projected);
++		}
++
++		void RecordAddResult(const gt::contact::AddResult result) noexcept
++		{
++			switch (result) {
++			case gt::contact::AddResult::accepted:
++				++g_telemetry.addAccepted;
++				break;
++			case gt::contact::AddResult::duplicateMerged:
++				++g_telemetry.addDuplicateMerged;
++				break;
++			case gt::contact::AddResult::invalidSample:
++				++g_telemetry.addInvalid;
++				break;
++			case gt::contact::AddResult::noOpenFrame:
++				++g_telemetry.addNoOpenFrame;
++				break;
++			case gt::contact::AddResult::capacityRetained:
++				++g_telemetry.addCapacityRetained;
++				break;
++			case gt::contact::AddResult::capacityDropped:
++				++g_telemetry.addCapacityDropped;
++				break;
++			}
++		}
++
++		[[nodiscard]] bool FinalizeSubstepTelemetryLocked() noexcept
++		{
++			g_telemetry.observedSubsteps += g_substepIndex;
++			if (g_substepIndex < g_currentFrameSubstepCount) {
++				++g_telemetry.underflowFrames;
++				return true;
++			}
++			if (g_substepIndex > g_currentFrameSubstepCount) {
++				++g_telemetry.overflowFrames;
++				return true;
++			}
++			return false;
++		}
++
++		void LogProducerTelemetryLocked(const bool substepAnomaly) noexcept
++		{
++			const bool periodic =
++				g_telemetry.framesPublished >=
++				g_lastTelemetryLogFrame + kTelemetryFrameInterval;
++			const bool anomalyDue =
++				substepAnomaly &&
++				(g_lastAnomalyLogFrame == 0U ||
++				 g_telemetry.framesPublished >= g_lastAnomalyLogFrame + 60U);
++			if (!periodic && !anomalyDue) {
++				return;
++			}
++
++			g_lastTelemetryLogFrame = g_telemetry.framesPublished;
++			if (substepAnomaly) {
++				g_lastAnomalyLogFrame = g_telemetry.framesPublished;
++			}
++			if (anomalyDue) {
++				logger::warn(
++					"[GTContactBridge v0.8.4 producer] substep mismatch frame={} "
++					"observed={} expected={}",
++					g_currentFrameSequence,
++					g_substepIndex,
++					g_currentFrameSubstepCount);
++			}
++			logger::info(
++				"[GTContactBridge v0.8.4 producer] flow published={}/begun={} beginRejected={} "
++				"forcedClose={} substepsObserved={}/expected={} underFrames={} overFrames={} "
++				"overCallbacks={}",
++				g_telemetry.framesPublished,
++				g_telemetry.framesBegun,
++				g_telemetry.beginRejected,
++				g_telemetry.forcedFrameClose,
++				g_telemetry.observedSubsteps,
++				g_telemetry.expectedSubsteps,
++				g_telemetry.underflowFrames,
++				g_telemetry.overflowFrames,
++				g_telemetry.overflowCallbacks);
++			logger::info(
++				"[GTContactBridge v0.8.4 producer] capture manifolds={} endpointFail={} "
++				"nonBreast={} nonTarget={} points={} nonPenetrating={} invalidStepTime={} "
++				"invalidPhysics={} epochDrops={} "
++				"add(a/d/i/n/r/x)={}/{}/{}/{}/{}/{} continuity={}",
++				g_telemetry.manifoldsScanned,
++				g_telemetry.endpointDecodeFailures,
++				g_telemetry.nonBreastManifolds,
++				g_telemetry.nonTargetManifolds,
++				g_telemetry.contactPointsSeen,
++				g_telemetry.nonPenetratingPoints,
++				g_telemetry.invalidSubstepTimes,
++				g_telemetry.invalidPhysicsPoints,
++				g_telemetry.targetEpochDrops,
++				g_telemetry.addAccepted,
++				g_telemetry.addDuplicateMerged,
++				g_telemetry.addInvalid,
++				g_telemetry.addNoOpenFrame,
++				g_telemetry.addCapacityRetained,
++				g_telemetry.addCapacityDropped,
++				g_telemetry.continuitySubmitted);
++			logger::info(
++				"[GTContactBridge v0.8.4 producer] validatedSources finger={} hand={} arm={} leg={} "
++				"foot={} other={} breastBreast={} sameActor={} crossActor={} "
++				"maxDepth={:.5f} maxImpulse={:.5f} maxApproach={:.5f}",
++				g_telemetry.fingerContacts,
++				g_telemetry.handContacts,
++				g_telemetry.armContacts,
++				g_telemetry.legContacts,
++				g_telemetry.footContacts,
++				g_telemetry.otherExternalContacts,
++				g_telemetry.breastToBreastContacts,
++				g_telemetry.sameActorContacts,
++				g_telemetry.crossActorContacts,
++				g_telemetry.maximumDepth,
++				g_telemetry.maximumImpulse,
++				g_telemetry.maximumApproachSpeed);
++		}
++
++		[[nodiscard]] bool BetterContinuityRepresentative(
++			const GTContactSampleV1& candidate,
++			const GTContactSampleV1& incumbent) noexcept
++		{
++			if (candidate.penetrationDepth != incumbent.penetrationDepth) {
++				return candidate.penetrationDepth > incumbent.penetrationDepth;
++			}
++			if (candidate.normalImpulse != incumbent.normalImpulse) {
++				return candidate.normalImpulse > incumbent.normalImpulse;
++			}
++			return ApproachSpeed(candidate) > ApproachSpeed(incumbent);
++		}
++
++		void ClearContinuityLocked() noexcept
++		{
++			g_continuityPairCount = 0U;
++		}
++
++		[[nodiscard]] ContinuityPair* FindContinuityPairLocked(
++			const GTContactEndpointV1& endpointA,
++			const GTContactEndpointV1& endpointB) noexcept
++		{
++			for (std::size_t index = 0; index < g_continuityPairCount; ++index) {
++				auto& pair = g_continuityPairs[index];
++				if (CompareEndpointIdentity(pair.endpointA, endpointA) == 0 &&
++					CompareEndpointIdentity(pair.endpointB, endpointB) == 0) {
++					return &pair;
++				}
++			}
++			return nullptr;
++		}
++
++		void StoreAbsoluteContactPoints(GTContactSampleV1& sample) noexcept
++		{
++			for (std::size_t axis = 0; axis < g_currentFrameOriginOffset.size(); ++axis) {
++				sample.pointOnA[axis] += g_currentFrameOriginOffset[axis];
++				sample.pointOnB[axis] += g_currentFrameOriginOffset[axis];
++			}
++		}
++
++		void RecordContinuitySampleLocked(const GTContactSampleV1& sample) noexcept
++		{
++			if (g_currentFrameSequence == 0U || g_currentFrameTargetGeneration == 0U ||
++				g_currentFrameTargetGeneration != g_activeTargetGeneration) {
++				return;
++			}
++
++			const GTContactEndpointV1* endpointA = nullptr;
++			const GTContactEndpointV1* endpointB = nullptr;
++			CanonicalPair(sample, endpointA, endpointB);
++			auto* pair = FindContinuityPairLocked(*endpointA, *endpointB);
++			if (!pair) {
++				if (g_continuityPairCount == g_continuityPairs.size()) {
++					return;
++				}
++				pair = &g_continuityPairs[g_continuityPairCount++];
++				*pair = {};
++				pair->endpointA = *endpointA;
++				pair->endpointB = *endpointB;
++			}
++
++			if (pair->targetGeneration != g_currentFrameTargetGeneration ||
++				pair->lastRealFrameSequence != g_currentFrameSequence ||
++				BetterContinuityRepresentative(sample, pair->strongestRealSample)) {
++				pair->strongestRealSample = sample;
++				StoreAbsoluteContactPoints(pair->strongestRealSample);
++			}
++			pair->targetGeneration = g_currentFrameTargetGeneration;
++			pair->lastRealFrameSequence = g_currentFrameSequence;
++		}
++
++		[[nodiscard]] constexpr char LowerAscii(const char value) noexcept
++		{
++			return value >= 'A' && value <= 'Z' ? static_cast<char>(value - 'A' + 'a') : value;
++		}
++
++		[[nodiscard]] bool ContainsAsciiInsensitive(
++			const std::string_view value,
++			const std::string_view token) noexcept
++		{
++			if (token.empty() || token.size() > value.size()) {
++				return false;
++			}
++			for (std::size_t start = 0; start + token.size() <= value.size(); ++start) {
++				bool matches = true;
++				for (std::size_t offset = 0; offset < token.size(); ++offset) {
++					if (LowerAscii(value[start + offset]) != LowerAscii(token[offset])) {
++						matches = false;
++						break;
++					}
++				}
++				if (matches) {
++					return true;
++				}
++			}
++			return false;
++		}
++
++		void RecordExternalFamily(const GTContactEndpointV1& endpoint) noexcept
++		{
++			if ((endpoint.flags & GT_CONTACT_ENDPOINT_EXTERNAL_COLLIDER) == 0U) {
++				return;
++			}
++
++			const std::string_view name{ endpoint.boneName };
++			if (ContainsAsciiInsensitive(name, "finger") ||
++				ContainsAsciiInsensitive(name, "thumb")) {
++				++g_telemetry.fingerContacts;
++			} else if (ContainsAsciiInsensitive(name, "hand")) {
++				++g_telemetry.handContacts;
++			} else if (ContainsAsciiInsensitive(name, "forearm") ||
++				ContainsAsciiInsensitive(name, "upperarm") ||
++				ContainsAsciiInsensitive(name, "clavicle") ||
++				ContainsAsciiInsensitive(name, "arm")) {
++				++g_telemetry.armContacts;
++			} else if (ContainsAsciiInsensitive(name, "foot") ||
++				ContainsAsciiInsensitive(name, "toe")) {
++				++g_telemetry.footContacts;
++			} else if (ContainsAsciiInsensitive(name, "thigh") ||
++				ContainsAsciiInsensitive(name, "calf") ||
++				ContainsAsciiInsensitive(name, "knee") ||
++				ContainsAsciiInsensitive(name, "leg")) {
++				++g_telemetry.legContacts;
++			} else {
++				++g_telemetry.otherExternalContacts;
++			}
++		}
++
++		void RecordContactSource(const GTContactSampleV1& sample) noexcept
++		{
++			const bool breastA =
++				(sample.endpointA.flags & GT_CONTACT_ENDPOINT_BREAST) != 0U;
++			const bool breastB =
++				(sample.endpointB.flags & GT_CONTACT_ENDPOINT_BREAST) != 0U;
++			if (breastA && breastB) {
++				++g_telemetry.breastToBreastContacts;
++			}
++			if (sample.endpointA.skeletonToken == sample.endpointB.skeletonToken) {
++				++g_telemetry.sameActorContacts;
++			} else {
++				++g_telemetry.crossActorContacts;
++			}
++			RecordExternalFamily(sample.endpointA);
++			RecordExternalFamily(sample.endpointB);
++			g_telemetry.maximumDepth =
++				std::max(g_telemetry.maximumDepth, sample.penetrationDepth);
++			g_telemetry.maximumImpulse =
++				std::max(g_telemetry.maximumImpulse, sample.normalImpulse);
++			g_telemetry.maximumApproachSpeed =
++				std::max(g_telemetry.maximumApproachSpeed, ApproachSpeed(sample));
++		}
++
++		[[nodiscard]] bool IsBreastBoneName(const std::string_view name) noexcept
++		{
++			return ContainsAsciiInsensitive(name, "soft_l") ||
++			       ContainsAsciiInsensitive(name, "soft_r");
++		}
++
++		[[nodiscard]] bool CopyBoneName(
++			const char* source,
++			char (&destination)[GT_CONTACT_BONE_NAME_CAPACITY]) noexcept
++		{
++			constexpr std::string_view unnamed{ "<unnamed>" };
++			const std::string_view value = source && *source ? std::string_view(source) : unnamed;
++			const std::size_t count = std::min(
++				value.size(),
++				static_cast<std::size_t>(GT_CONTACT_BONE_NAME_CAPACITY - 1U));
++			std::memcpy(destination, value.data(), count);
++			destination[count] = '\0';
++			return IsBreastBoneName(std::string_view(destination, count));
++		}
++
++		[[nodiscard]] bool MakeEndpoint(
++			const btCollisionObject* object,
++			GTContactEndpointV1& endpoint) noexcept
++		{
++			if (!object || !object->getUserPointer()) {
++				return false;
++			}
++
++			auto* baseBone = static_cast<SkinnedMeshBone*>(object->getUserPointer());
++			auto* bone = dynamic_cast<SkyrimBone*>(baseBone);
++			if (!bone || !bone->m_skeleton) {
++				return false;
++			}
++
++			endpoint = {};
++			endpoint.structSize = sizeof(endpoint);
++			endpoint.skeletonToken = reinterpret_cast<std::uint64_t>(bone->m_skeleton.get());
++			endpoint.rigidBodyToken = reinterpret_cast<std::uint64_t>(object);
++			if (object->isStaticObject()) {
++				endpoint.flags |= GT_CONTACT_ENDPOINT_STATIC;
++			} else if (object->isKinematicObject()) {
++				endpoint.flags |= GT_CONTACT_ENDPOINT_KINEMATIC;
++			} else {
++				endpoint.flags |= GT_CONTACT_ENDPOINT_DYNAMIC;
++			}
++
++			const bool breast = CopyBoneName(bone->m_name.c_str(), endpoint.boneName);
++			endpoint.flags |= breast ? GT_CONTACT_ENDPOINT_BREAST :
++			                           GT_CONTACT_ENDPOINT_EXTERNAL_COLLIDER;
++			endpoint.boneNameHash = gt::contact::ContactFrameCollector::HashBoneName(
++				endpoint.boneName);
++			return endpoint.skeletonToken != 0U && endpoint.rigidBodyToken != 0U &&
++			       endpoint.boneNameHash != 0U;
++		}
++
++		void CopyVector(const btVector3& source, float (&destination)[3]) noexcept
++		{
++			destination[0] = static_cast<float>(source.x());
++			destination[1] = static_cast<float>(source.y());
++			destination[2] = static_cast<float>(source.z());
++		}
++
++		[[nodiscard]] bool IsFiniteVector(const btVector3& value) noexcept
++		{
++			return std::isfinite(static_cast<float>(value.x())) &&
++			       std::isfinite(static_cast<float>(value.y())) &&
++			       std::isfinite(static_cast<float>(value.z()));
++		}
++
++		[[nodiscard]] btVector3 PointVelocity(
++			const btCollisionObject* object,
++			const btVector3& worldPoint) noexcept
++		{
++			const auto* body = btRigidBody::upcast(object);
++			return body ? body->getVelocityInLocalPoint(
++			                  worldPoint - body->getCenterOfMassPosition()) :
++			              btVector3{ 0.0F, 0.0F, 0.0F };
++		}
++
++		GTContactStatusV1 GT_CONTACT_CALL CopyLatestFrame(
++			GTContactFrameV1* outFrame,
++			GTContactSampleV1* outSamples,
++			const std::uint32_t sampleCapacity,
++			std::uint32_t* outCopiedSampleCount)
++		{
++			// Keep the target epoch stable through destination validation and
++			// snapshot copying.  SetTargetSkeletons uses the same mutex, making
++			// ownership mismatch and normal "new frame pending" states distinct.
++			std::scoped_lock lock(g_targetMutex);
++			return g_collector.CopyLatest(
++				outFrame, outSamples, sampleCapacity, outCopiedSampleCount,
++				g_pendingTargetGeneration);
++		}
++
++		GTContactStatusV1 GT_CONTACT_CALL SetCaptureEnabled(const std::uint32_t enabled)
++		{
++			if (enabled > 1U) {
++				return GT_CONTACT_STATUS_INVALID_ARGUMENT;
++			}
++			const bool captureEnabled = enabled != 0U;
++			g_captureEnabled.store(captureEnabled, std::memory_order_release);
++			if (!captureEnabled) {
++				std::scoped_lock lock(g_targetMutex);
++				ClearContinuityLocked();
++			}
++			logger::info(
++				"[GTContactBridge v0.8.4 producer] capture {}",
++				captureEnabled ? "enabled" : "disabled");
++			return GT_CONTACT_STATUS_OK;
++		}
++
++		GTContactStatusV1 GT_CONTACT_CALL SetTargetSkeletons(
++			const std::uint64_t* skeletonTokens,
++			const std::uint32_t skeletonTokenCount,
++			std::uint64_t* outTargetGeneration)
++		{
++			if (skeletonTokenCount > GT_CONTACT_MAX_TARGET_SKELETONS ||
++				(skeletonTokenCount != 0U && !skeletonTokens) || !outTargetGeneration) {
++				return GT_CONTACT_STATUS_INVALID_ARGUMENT;
++			}
++			*outTargetGeneration = 0U;
++
++			std::array<std::uint64_t, GT_CONTACT_MAX_TARGET_SKELETONS> sorted{};
++			std::size_t count = 0;
++			for (std::uint32_t index = 0; index < skeletonTokenCount; ++index) {
++				if (skeletonTokens[index] == 0U) {
++					return GT_CONTACT_STATUS_INVALID_ARGUMENT;
++				}
++				sorted[count++] = skeletonTokens[index];
++			}
++			std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(count));
++			const auto uniqueEnd = std::unique(
++				sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(count));
++			count = static_cast<std::size_t>(uniqueEnd - sorted.begin());
++
++			std::scoped_lock lock(g_targetMutex);
++			std::uint64_t nextGeneration = 0U;
++			const auto generationStatus = gt::contact::AdvanceTargetGeneration(
++				g_pendingTargetGeneration, &nextGeneration);
++			if (generationStatus != GT_CONTACT_STATUS_OK) {
++				return generationStatus;
++			}
++			g_pendingTargets = sorted;
++			g_pendingTargetCount = count;
++			g_pendingTargetGeneration = nextGeneration;
++			// Every successful target update starts a new ownership epoch, even
++			// when the token list is textually identical.  Never carry a held pair
++			// across that boundary.
++			ClearContinuityLocked();
++			*outTargetGeneration = g_pendingTargetGeneration;
++			logger::info(
++				"[GTContactBridge v0.8.4 producer] target epoch={} skeletons={}",
++				g_pendingTargetGeneration,
++				g_pendingTargetCount);
++			return GT_CONTACT_STATUS_OK;
++		}
++
++		[[nodiscard]] bool IsActiveTarget(const std::uint64_t skeletonToken) noexcept
++		{
++			return std::binary_search(
++				g_activeTargets.begin(),
++				g_activeTargets.begin() + static_cast<std::ptrdiff_t>(g_activeTargetCount),
++				skeletonToken);
++		}
++
++		void RemoveContinuityPairLocked(const std::size_t index) noexcept
++		{
++			--g_continuityPairCount;
++			if (index != g_continuityPairCount) {
++				g_continuityPairs[index] = g_continuityPairs[g_continuityPairCount];
++			}
++			g_continuityPairs[g_continuityPairCount] = {};
++		}
++
++		void PruneExpiredContinuityLocked() noexcept
++		{
++			std::size_t index = 0U;
++			while (index < g_continuityPairCount) {
++				const auto& pair = g_continuityPairs[index];
++				const bool invalidSequence = pair.lastRealFrameSequence == 0U ||
++					pair.lastRealFrameSequence > g_currentFrameSequence;
++				const bool expired = !invalidSequence &&
++					g_currentFrameSequence - pair.lastRealFrameSequence >
++						kContinuityMissingFrameTtl;
++				if (pair.targetGeneration != g_currentFrameTargetGeneration ||
++					invalidSequence || expired ||
++					(!IsActiveTarget(pair.endpointA.skeletonToken) &&
++					 !IsActiveTarget(pair.endpointB.skeletonToken))) {
++					RemoveContinuityPairLocked(index);
++					continue;
++				}
++				++index;
++			}
++		}
++
++		void AddContinuitySamplesLocked() noexcept
++		{
++			if (g_currentFrameSequence == 0U || g_currentFrameSubstepCount == 0U ||
++				g_currentFrameTargetGeneration == 0U ||
++				g_currentFrameTargetGeneration != g_activeTargetGeneration ||
++				g_activeTargetGeneration != g_pendingTargetGeneration) {
++				ClearContinuityLocked();
++				return;
++			}
++
++			std::size_t index = 0U;
++			while (index < g_continuityPairCount) {
++				auto& pair = g_continuityPairs[index];
++				if (pair.targetGeneration != g_currentFrameTargetGeneration ||
++					pair.lastRealFrameSequence == 0U ||
++					pair.lastRealFrameSequence > g_currentFrameSequence ||
++					(!IsActiveTarget(pair.endpointA.skeletonToken) &&
++					 !IsActiveTarget(pair.endpointB.skeletonToken))) {
++					RemoveContinuityPairLocked(index);
++					continue;
++				}
++
++				const std::uint64_t age =
++					g_currentFrameSequence - pair.lastRealFrameSequence;
++				if (age == 0U) {
++					++index;
++					continue;
++				}
++				if (age > kContinuityMissingFrameTtl) {
++					RemoveContinuityPairLocked(index);
++					continue;
++				}
++
++				GTContactSampleV1 held = pair.strongestRealSample;
++				held.frameSequence = 0U;
++				held.substepIndex = g_currentFrameSubstepCount - 1U;
++				held.timeStep = g_lastObservedSubstepTime > 0.0F ?
++					g_lastObservedSubstepTime :
++					g_currentFrameTimeStep /
++						static_cast<float>(g_currentFrameSubstepCount);
++				const float remaining = static_cast<float>(
++					kContinuityMissingFrameTtl + 1U - age);
++				held.penetrationDepth =
++					pair.strongestRealSample.penetrationDepth *
++					(remaining / kContinuityDecayDivisor);
++				// Stale impulse or velocity would add energy and turn a continuity hold
++				// into a ghost push.  Only the decaying penetration survives.
++				held.normalImpulse = 0.0F;
++				for (std::size_t axis = 0; axis < g_currentFrameOriginOffset.size(); ++axis) {
++					held.pointOnA[axis] -= g_currentFrameOriginOffset[axis];
++					held.pointOnB[axis] -= g_currentFrameOriginOffset[axis];
++					held.relativeVelocityAminusB[axis] = 0.0F;
++				}
++				const auto addResult = g_collector.Add(held);
++				++g_telemetry.continuitySubmitted;
++				RecordAddResult(addResult);
++				if (addResult == gt::contact::AddResult::invalidSample ||
++					addResult == gt::contact::AddResult::noOpenFrame) {
++					RemoveContinuityPairLocked(index);
++					continue;
++				}
++				++index;
++			}
++		}
++	}
++
++	bool IsCaptureEnabled() noexcept
++	{
++		return g_captureEnabled.load(std::memory_order_acquire);
++	}
++
++	void BeginFrame(
++		const float frameTimeStep,
++		const btVector3& originOffset,
++		const std::uint32_t substepCount) noexcept
++	{
++		if (g_frameOpen) {
++			// A second begin means the preceding physics frame was not closed
++			// normally.  Publish what was actually observed, but do not extend
++			// potentially stale pairs through the discontinuity.
++			std::scoped_lock lock(g_targetMutex);
++			ClearContinuityLocked();
++			const bool substepAnomaly = FinalizeSubstepTelemetryLocked();
++			if (g_collector.EndFrame()) {
++				++g_telemetry.framesPublished;
++			}
++			++g_telemetry.forcedFrameClose;
++			LogProducerTelemetryLocked(substepAnomaly);
++			g_frameOpen = false;
++		}
++		if (!IsCaptureEnabled()) {
++			return;
++		}
++
++		const std::array<float, 3> offset{
++			static_cast<float>(originOffset.x()),
++			static_cast<float>(originOffset.y()),
++			static_cast<float>(originOffset.z()),
++		};
++		std::scoped_lock lock(g_targetMutex);
++		g_activeTargets = g_pendingTargets;
++		g_activeTargetCount = g_pendingTargetCount;
++		g_activeTargetGeneration = g_pendingTargetGeneration;
++		if (g_currentFrameTargetGeneration != 0U &&
++			g_currentFrameTargetGeneration != g_activeTargetGeneration) {
++			ClearContinuityLocked();
++		}
++
++		g_substepIndex = 0U;
++		g_lastObservedSubstepTime = 0.0F;
++		const std::uint64_t frameSequence = g_nextFrameSequence++;
++		g_frameOpen = g_collector.BeginFrame(
++			frameSequence, frameTimeStep, offset, substepCount,
++			g_activeTargetGeneration);
++		if (!g_frameOpen) {
++			++g_telemetry.beginRejected;
++			ClearContinuityLocked();
++			g_currentFrameSequence = 0U;
++			g_currentFrameTargetGeneration = 0U;
++			g_currentFrameTimeStep = 0.0F;
++			g_currentFrameSubstepCount = 0U;
++			g_currentFrameOriginOffset = {};
++			return;
++		}
++		g_currentFrameSequence = frameSequence;
++		g_currentFrameTargetGeneration = g_activeTargetGeneration;
++		g_currentFrameTimeStep = frameTimeStep;
++		g_currentFrameSubstepCount = substepCount;
++		g_currentFrameOriginOffset = offset;
++		++g_telemetry.framesBegun;
++		g_telemetry.expectedSubsteps += substepCount;
++		PruneExpiredContinuityLocked();
++	}
++
++	void CollectSolvedManifolds(btDispatcher* dispatcher, const float substepTime) noexcept
++	{
++		if (!g_frameOpen || !dispatcher) {
++			return;
++		}
++
++		// This callback occurs once for every actual Bullet solve.  Advance the
++		// index even if there are no targets or manifolds; otherwise the next
++		// contact-bearing substep is mislabeled as substep zero.
++		const std::uint32_t currentSubstep = g_substepIndex;
++		if (g_substepIndex != std::numeric_limits<std::uint32_t>::max()) {
++			++g_substepIndex;
++		}
++		if (currentSubstep >= g_currentFrameSubstepCount) {
++			// Never feed an out-of-range sample to the ABI collector.  ABI v1 marks
++			// the whole frame invalid when even one such sample is submitted.
++			++g_telemetry.overflowCallbacks;
++			return;
++		}
++		if (!std::isfinite(substepTime) || substepTime <= 0.0F ||
++			substepTime > g_currentFrameTimeStep) {
++			++g_telemetry.invalidSubstepTimes;
++			return;
++		}
++		g_lastObservedSubstepTime = substepTime;
++		if (!IsCaptureEnabled()) {
++			return;
++		}
++		if (g_activeTargetCount == 0U) {
++			return;
++		}
++
++		const int manifoldCount = dispatcher->getNumManifolds();
++		if (manifoldCount > 0) {
++			g_telemetry.manifoldsScanned += static_cast<std::uint64_t>(manifoldCount);
++		}
++		for (int manifoldIndex = 0; manifoldIndex < manifoldCount; ++manifoldIndex) {
++			auto* manifold = dispatcher->getManifoldByIndexInternal(manifoldIndex);
++			if (!manifold) {
++				continue;
++			}
++
++			const auto* objectA = static_cast<const btCollisionObject*>(manifold->getBody0());
++			const auto* objectB = static_cast<const btCollisionObject*>(manifold->getBody1());
++			GTContactEndpointV1 endpointA{};
++			GTContactEndpointV1 endpointB{};
++			const bool endpointAValid = MakeEndpoint(objectA, endpointA);
++			const bool endpointBValid = MakeEndpoint(objectB, endpointB);
++			if (!endpointAValid || !endpointBValid) {
++				++g_telemetry.endpointDecodeFailures;
++				continue;
++			}
++			if (((endpointA.flags | endpointB.flags) & GT_CONTACT_ENDPOINT_BREAST) == 0U) {
++				++g_telemetry.nonBreastManifolds;
++				continue;
++			}
++			if (!IsActiveTarget(endpointA.skeletonToken) &&
++				!IsActiveTarget(endpointB.skeletonToken)) {
++				++g_telemetry.nonTargetManifolds;
++				continue;
++			}
++
++			const int contactCount = manifold->getNumContacts();
++			for (int contactIndex = 0; contactIndex < contactCount; ++contactIndex) {
++				++g_telemetry.contactPointsSeen;
++				const auto& point = manifold->getContactPoint(contactIndex);
++				const float depth = static_cast<float>(-point.getDistance());
++				if (!std::isfinite(depth) || depth <= 0.0F) {
++					++g_telemetry.nonPenetratingPoints;
++					continue;
++				}
++				const float appliedImpulse = static_cast<float>(point.m_appliedImpulse);
++
++				GTContactSampleV1 sample{};
++				sample.structSize = sizeof(sample);
++				sample.flags = GT_CONTACT_SAMPLE_BREAST_RELEVANT;
++				sample.substepIndex = currentSubstep;
++				sample.timeStep = substepTime;
++				sample.penetrationDepth = depth;
++				sample.normalImpulse = std::max(0.0F, appliedImpulse);
++				sample.endpointA = endpointA;
++				sample.endpointB = endpointB;
++
++				const btVector3 pointA = point.getPositionWorldOnA();
++				const btVector3 pointB = point.getPositionWorldOnB();
++				const btVector3 normalOnB = point.m_normalWorldOnB;
++				const btVector3 relativeVelocity =
++					PointVelocity(objectA, pointA) - PointVelocity(objectB, pointB);
++				const float normalLengthSquared = static_cast<float>(normalOnB.length2());
++				if (!std::isfinite(appliedImpulse) || !IsFiniteVector(pointA) ||
++					!IsFiniteVector(pointB) || !IsFiniteVector(normalOnB) ||
++					!IsFiniteVector(relativeVelocity) ||
++					!std::isfinite(normalLengthSquared) ||
++					normalLengthSquared <= std::numeric_limits<float>::epsilon()) {
++					++g_telemetry.invalidPhysicsPoints;
++					continue;
++				}
++				CopyVector(pointA, sample.pointOnA);
++				CopyVector(pointB, sample.pointOnB);
++				CopyVector(normalOnB, sample.normalOnB);
++				CopyVector(relativeVelocity, sample.relativeVelocityAminusB);
++				{
++					// Synchronize cache ownership with capture/target updates.  A target
++					// change makes the open old-epoch frame intentionally non-consumable.
++					std::scoped_lock lock(g_targetMutex);
++					if (!IsCaptureEnabled() ||
++						g_activeTargetGeneration != g_pendingTargetGeneration ||
++						g_currentFrameTargetGeneration != g_activeTargetGeneration) {
++						++g_telemetry.targetEpochDrops;
++						continue;
++					}
++					const auto addResult = g_collector.Add(sample);
++					RecordAddResult(addResult);
++					if (addResult != gt::contact::AddResult::invalidSample &&
++						addResult != gt::contact::AddResult::noOpenFrame) {
++						RecordContactSource(sample);
++						RecordContinuitySampleLocked(sample);
++					}
++				}
++			}
++		}
++	}
++
++	void EndFrame() noexcept
++	{
++		if (!g_frameOpen) {
++			return;
++		}
++		std::scoped_lock lock(g_targetMutex);
++		const bool substepAnomaly = FinalizeSubstepTelemetryLocked();
++		if (!substepAnomaly && IsCaptureEnabled() &&
++			g_activeTargetGeneration == g_pendingTargetGeneration) {
++			AddContinuitySamplesLocked();
++		} else {
++			ClearContinuityLocked();
++		}
++		if (g_collector.EndFrame()) {
++			++g_telemetry.framesPublished;
++		}
++		LogProducerTelemetryLocked(substepAnomaly);
++		g_frameOpen = false;
++	}
++}
++
++extern "C" __declspec(dllexport) const GTContactBridgeV1* GT_CONTACT_CALL
++GTFSMP_GetContactBridgeV1(
++	const std::uint32_t requestedAbiVersion,
++	const std::uint32_t callerBridgeStructSize)
++{
++	static const GTContactBridgeV1 bridge{
++		sizeof(GTContactBridgeV1),
++		GT_CONTACT_ABI_V1,
++		sizeof(GTContactFrameV1),
++		sizeof(GTContactSampleV1),
++		sizeof(GTContactEndpointV1),
++		0U,
++		&hdt::gtcontact::CopyLatestFrame,
++		&hdt::gtcontact::SetCaptureEnabled,
++		&hdt::gtcontact::SetTargetSkeletons,
++		{},
++	};
++	if (requestedAbiVersion != GT_CONTACT_ABI_V1 ||
++		callerBridgeStructSize != sizeof(GTContactBridgeV1)) {
++		return nullptr;
++	}
++	static std::atomic_bool loggedConnection{ false };
++	if (!loggedConnection.exchange(true, std::memory_order_relaxed)) {
++		logger::info(
++			"[GTContactBridge v0.8.4 producer] ABI v1 connected; corrected multi-substep "
++			"capture and source telemetry active");
++	}
++	return &bridge;
++}
++
+diff -ruN up_v4.1.1/src/GTContactBridgeProducer.h mine_v4.1.1/src/GTContactBridgeProducer.h
+--- up_v4.1.1/src/GTContactBridgeProducer.h	1970-01-01 09:00:00.000000000 +0900
++++ mine_v4.1.1/src/GTContactBridgeProducer.h	2026-09-29 20:40:18.744677400 +0900
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <cstdint>
++
++class btDispatcher;
++class btVector3;
++
++namespace hdt::gtcontact
++{
++	[[nodiscard]] bool IsCaptureEnabled() noexcept;
++
++	void BeginFrame(
++		float frameTimeStep,
++		const btVector3& originOffset,
++		std::uint32_t substepCount) noexcept;
++
++	void CollectSolvedManifolds(btDispatcher* dispatcher, float substepTime) noexcept;
++	void EndFrame() noexcept;
++}
++
+diff -ruN up_v4.1.1/src/GTContactFrameTiming.h mine_v4.1.1/src/GTContactFrameTiming.h
+--- up_v4.1.1/src/GTContactFrameTiming.h	1970-01-01 09:00:00.000000000 +0900
++++ mine_v4.1.1/src/GTContactFrameTiming.h	2026-09-29 20:40:18.744677400 +0900
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <limits>
++
++namespace hdt::gtcontact
++{
++	// Keep this value shared with SkinnedMeshWorld::stepSimulation.  Contact
++	// frames must advertise the number of Bullet substeps that will actually be
++	// executed; otherwise every contact from substep 1+ is rejected by ABI v1.
++	inline constexpr float kMinimumSimulationPeriod = 1.0F / 300.0F;
++
++	[[nodiscard]] inline std::uint32_t CalculateSimulationSubstepCount(
++		const float totalTimeStep,
++		const float fixedTimeStep) noexcept
++	{
++		if (!std::isfinite(totalTimeStep) || !std::isfinite(fixedTimeStep) ||
++			totalTimeStep <= 0.0F || fixedTimeStep <= 0.0F) {
++			return 0U;
++		}
++
++		float remaining = totalTimeStep;
++		std::uint32_t count = 0U;
++		while (remaining > fixedTimeStep) {
++			if (count == std::numeric_limits<std::uint32_t>::max()) {
++				return count;
++			}
++			const float next = remaining - fixedTimeStep;
++			// Guard pathological floating-point inputs from making the counting
++			// loop non-progressing.  Normal FSMP input is bounded to maxSubSteps.
++			if (!(next < remaining)) {
++				return std::numeric_limits<std::uint32_t>::max();
++			}
++			remaining = next;
++			++count;
++		}
++
++		if (remaining > kMinimumSimulationPeriod &&
++			count != std::numeric_limits<std::uint32_t>::max()) {
++			++count;
++		}
++		return count;
++	}
++}
++
+diff -ruN up_v4.1.1/src/hdtSkinnedMesh/hdtSkinnedMeshWorld.cpp mine_v4.1.1/src/hdtSkinnedMesh/hdtSkinnedMeshWorld.cpp
+--- up_v4.1.1/src/hdtSkinnedMesh/hdtSkinnedMeshWorld.cpp	2026-08-27 03:59:52.000000000 +0900
++++ mine_v4.1.1/src/hdtSkinnedMesh/hdtSkinnedMeshWorld.cpp	2026-09-29 20:40:18.736450500 +0900
+@@ -1,5 +1,8 @@
+-#include "hdtSkinnedMeshWorld.h"
+-#include "hdtBoneScaleConstraint.h"
++#include "hdtSkinnedMeshWorld.h"
++
++#include "GTContactBridgeProducer.h"
++#include "GTContactFrameTiming.h"
++#include "hdtBoneScaleConstraint.h"
+ #include "hdtDispatcher.h"
+ #include "hdtSkinnedMeshAlgorithm.h"
+ #include "hdtSkyrimPhysicsWorld.h"
+@@ -164,9 +167,8 @@
+ 		// Because Bullet's constraint solvers (ERP/CFM) are sensitive to delta-time,
+ 		// this variable tick can cause constraints to behave a bit differently
+ 		// (appearing more stiff or damping differently at various framerates).
+-		constexpr auto minPossiblePeriod = 1.0f / 300.0f;
+-		if (remainingTimeStep > minPossiblePeriod)
+-			internalSingleStepSimulation(remainingTimeStep);
++		if (remainingTimeStep > gtcontact::kMinimumSimulationPeriod)
++			internalSingleStepSimulation(remainingTimeStep);
+ 		clearForces();
+ 
+ 		_bodies.clear();
+@@ -435,7 +437,8 @@
+ 			}
+ 		}
+ 
+-		btDiscreteDynamicsWorldMt::solveConstraints(solverInfo);
++		btDiscreteDynamicsWorldMt::solveConstraints(solverInfo);
++		gtcontact::CollectSolvedManifolds(m_dispatcher1, solverInfo.m_timeStep);
+ 
+ 		// the HDT manifolds are still recreated every frame, clear to prevent stale data.
+ 		static_cast<CollisionDispatcher*>(m_dispatcher1)->clearAllManifold();
+diff -ruN up_v4.1.1/src/hdtSkyrimPhysicsWorld.cpp mine_v4.1.1/src/hdtSkyrimPhysicsWorld.cpp
+--- up_v4.1.1/src/hdtSkyrimPhysicsWorld.cpp	2026-08-27 03:59:52.000000000 +0900
++++ mine_v4.1.1/src/hdtSkyrimPhysicsWorld.cpp	2026-09-29 20:40:18.741673200 +0900
+@@ -1,5 +1,7 @@
+-#include "hdtSkyrimPhysicsWorld.h"
+-#include "PluginInterfaceImpl.h"
++#include "hdtSkyrimPhysicsWorld.h"
++#include "GTContactBridgeProducer.h"
++#include "GTContactFrameTiming.h"
++#include "PluginInterfaceImpl.h"
+ #include "WeatherManager.h"
+ #include "hdtPhysicsProfiler.h"
+ 
+@@ -150,12 +152,23 @@
+ 		g_pluginInterface.onPreStep({ getCollisionObjectArray(), remainingTimeStep });
+ 
+ 		{
+-			BT_PROFILE("HDTSMP_doUpdate2ndStep");
+-			updateActiveState();
+-			auto offset = applyTranslationOffset();
+-			stepSimulation(remainingTimeStep, 0, tick);
+-			restoreTranslationOffset(offset);
+-			m_accumulatedInterval = 0;
++			BT_PROFILE("HDTSMP_doUpdate2ndStep");
++			updateActiveState();
++			auto offset = applyTranslationOffset();
++			const auto contactSubstepCount =
++				gtcontact::CalculateSimulationSubstepCount(remainingTimeStep, tick);
++			if (contactSubstepCount != 0U) {
++				gtcontact::BeginFrame(
++					remainingTimeStep,
++					offset,
++					contactSubstepCount);
++			}
++			stepSimulation(remainingTimeStep, 0, tick);
++			restoreTranslationOffset(offset);
++			if (contactSubstepCount != 0U) {
++				gtcontact::EndFrame();
++			}
++			m_accumulatedInterval = 0;
+ 			m_pendingTransformUpdate = true;
+ 		}
+ 
