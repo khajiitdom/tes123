@@ -20,9 +20,11 @@ jobs:
       - name: Apply contact bridge patch
         shell: bash
         run: |
+          ls -la
+          sed 's/\r$//' FSMP_v4.1.1_contact_bridge_LF.patch > patch_lf.patch
           cd fsmp_4_1_1_avx2
-          git apply --check ../FSMP_v4.1.1_contact_bridge_LF.patch
-          git apply --whitespace=nowarn ../FSMP_v4.1.1_contact_bridge_LF.patch
+          git apply --check ../patch_lf.patch
+          git apply --whitespace=nowarn ../patch_lf.patch
 
       - name: Configure (preset vs2022-windows-avx2)
         shell: pwsh
